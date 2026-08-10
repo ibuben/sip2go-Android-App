@@ -165,6 +165,7 @@
     <string name="status_disconnected">Disconnected: %1$s</string>
     <string name="status_connected_to">Connected to %1$s</string>
     <string name="status_in_call_with">In call with %1$s</string>
+    <string name="status_audio_failed">Call audio failed to start — check microphone permission</string>
     <string name="status_calling">Calling %1$s…</string>
     <string name="status_call_ended_remote">Call ended by remote party</string>
     <string name="status_call_rejected">Call rejected</string>

@@ -897,24 +897,65 @@ class DeviceClient(
     }
 
     private fun startAudio(callId: UUID, preferredRoute: CallAudioRoute = capturePreferredAudioRoute()) {
-        CallAudioFocus.acquire(appContext)
-        DeviceService.ensureInCallForeground(appContext)
+        rememberUserAudioRoute(preferredRoute)
+        // FGS / AudioRecord must not race on the main thread under targetSdk 34+.
+        scope.launch(Dispatchers.Default) {
+            CallAudioFocus.acquire(appContext)
+            DeviceService.ensureInCallForeground(appContext)
+            var started = withContext(Dispatchers.Main.immediate) {
+                startAudioSessionNow(callId, preferredRoute)
+            }
+            if (!started) {
+                Log.w(TAG, "Call audio start failed — retrying after mic FGS settle")
+                delay(400)
+                DeviceService.ensureInCallForeground(appContext)
+                started = withContext(Dispatchers.Main.immediate) {
+                    if (!isCallStillActive(callId)) return@withContext false
+                    startAudioSessionNow(callId, preferredRoute)
+                }
+            }
+            if (!started) {
+                Log.e(TAG, "Call audio failed to start for $callId")
+                withContext(Dispatchers.Main.immediate) {
+                    if (isCallStillActive(callId)) {
+                        _statusMessage.value = msg(R.string.status_audio_failed)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun isCallStillActive(callId: UUID): Boolean {
+        return _activeCall.value?.callId == callId
+    }
+
+    private fun startAudioSessionNow(callId: UUID, preferredRoute: CallAudioRoute): Boolean {
+        if (_activeCall.value?.callId != callId) return false
         stopAudio(resetRouteUi = false)
         stopRingback(releaseAudio = false)
-        audioSession = CallAudioSession(
+        val session = CallAudioSession(
             context = appContext,
             callId = callId,
             onSendAudio = { payload -> webSocket?.sendAudio(payload) },
             onRouteChanged = { route -> scope.launch { publishAudioRoute(route) } },
-        ).also { session ->
-            rememberUserAudioRoute(preferredRoute)
-            try {
-                session.start(preferredRoute)
+        )
+        return try {
+            val ok = session.start(preferredRoute)
+            if (!ok) {
+                session.stop()
+                audioSession = null
+                false
+            } else {
+                audioSession = session
                 callRecorder?.let { session.setRecorder(it) }
                 publishAudioRoute(session.currentRoute())
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start call audio", e)
+                true
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start call audio", e)
+            runCatching { session.stop() }
+            audioSession = null
+            false
         }
     }
 
@@ -1192,8 +1233,9 @@ class DeviceClient(
                 }
                 beginRouteSettling()
                 CallConnectionRegistry.get(callId)?.setPreferredAudioRoute(preferredRoute)
-                startAudio(callId, preferredRoute)
+                // Telecom ACTIVE before AudioRecord — needed for mic FGS on Android 14+.
                 TelecomBridge.notifyActive(callId)
+                startAudio(callId, preferredRoute)
                 CallConnectionRegistry.get(callId)?.setPreferredAudioRoute(preferredRoute)
                 scheduleRouteEnforcement(callId)
                 applyCallHold(held)
@@ -1424,8 +1466,9 @@ class DeviceClient(
         callAcceptedAt[callId] = connectedAt
         _callConnectedAt.value = connectedAt
         CallConnectionRegistry.get(callId)?.setPreferredAudioRoute(preferredRoute)
-        startAudio(callId, preferredRoute)
+        // Telecom ACTIVE before AudioRecord — needed for mic FGS on Android 14+.
         TelecomBridge.notifyActive(callId)
+        startAudio(callId, preferredRoute)
         CallConnectionRegistry.get(callId)?.setPreferredAudioRoute(preferredRoute)
         scheduleRouteEnforcement(callId)
         val label = when {

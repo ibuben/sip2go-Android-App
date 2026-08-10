@@ -173,8 +173,21 @@ class DeviceService : LifecycleService() {
                     foregroundServiceType(inCall),
                 )
             } catch (e: Exception) {
-                android.util.Log.e("DeviceService", "startForeground failed", e)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                android.util.Log.e("DeviceService", "startForeground failed inCall=$inCall", e)
+                if (inCall) {
+                    // Never fall back to dataSync during a call — AudioRecord will be denied
+                    // under targetSdk 34+ and both audio directions go silent.
+                    try {
+                        startForeground(
+                            NOTIFICATION_ID,
+                            notification,
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                        )
+                    } catch (e2: Exception) {
+                        android.util.Log.e("DeviceService", "mic FGS retry failed", e2)
+                    }
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     startForeground(
                         NOTIFICATION_ID,
                         notification,
@@ -190,7 +203,9 @@ class DeviceService : LifecycleService() {
     private fun foregroundServiceType(inCall: Boolean): Int {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             return if (inCall) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                // Keep dataSync so the WSS service stays valid while mic type is active.
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
             } else {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
             }
@@ -276,6 +291,24 @@ class DeviceService : LifecycleService() {
             } else {
                 appContext.startService(intent)
             }
+            // startForegroundService is async — wait briefly so AudioRecord is not opened
+            // before the microphone FGS type is active (fails under targetSdk 34+).
+            val deadline = android.os.SystemClock.uptimeMillis() + 1_500L
+            while (android.os.SystemClock.uptimeMillis() < deadline) {
+                val service = runningInstance
+                if (service != null) {
+                    service.foregroundReleased = false
+                    service.ensureForeground(inCall = true)
+                    return
+                }
+                try {
+                    Thread.sleep(40L)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return
+                }
+            }
+            android.util.Log.w("DeviceService", "ensureInCallForeground: service not ready in time")
         }
 
         fun startIdle(context: Context) {

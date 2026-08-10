@@ -38,8 +38,11 @@ class CallAudioSession(
         recorder = value
     }
 
-    fun start(initialRoute: CallAudioRoute? = null) {
-        if (!running.compareAndSet(false, true)) return
+    fun isRunning(): Boolean = running.get()
+
+    /** @return true if capture/playback started successfully */
+    fun start(initialRoute: CallAudioRoute? = null): Boolean {
+        if (!running.compareAndSet(false, true)) return true
 
         val audioManager = context.getSystemService(AudioManager::class.java)
         previousAudioMode = audioManager.mode
@@ -56,8 +59,9 @@ class CallAudioSession(
         val minTrack = AudioTrack.getMinBufferSize(sampleRate, channelOut, encoding)
         val bufferSize = maxOf(minRecord, minTrack, codec.frameBytes * 8)
 
+        // VOICE_COMMUNICATION is required for reliable VoIP mic under modern FGS rules.
         audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
             sampleRate,
             channelIn,
             encoding,
@@ -66,7 +70,7 @@ class CallAudioSession(
         if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
             Log.e(TAG, "AudioRecord failed to initialize")
             stop()
-            return
+            return false
         }
 
         audioTrack = AudioTrack.Builder()
@@ -87,17 +91,23 @@ class CallAudioSession(
             .setBufferSizeInBytes(bufferSize)
             .build()
 
+        if (audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioTrack failed to initialize")
+            stop()
+            return false
+        }
+
         try {
             audioRecord?.startRecording()
             audioTrack?.play()
         } catch (e: SecurityException) {
             Log.e(TAG, "Microphone access denied — is FGS microphone active?", e)
             stop()
-            return
+            return false
         } catch (e: IllegalStateException) {
-            Log.e(TAG, "Failed to start audio capture", e)
+            Log.e(TAG, "Failed to start audio capture/playback", e)
             stop()
-            return
+            return false
         }
 
         captureThread = Thread({
@@ -127,6 +137,8 @@ class CallAudioSession(
                 offset = 0
             }
         }, "siptg-audio-capture").also { it.start() }
+
+        return true
     }
 
     fun playIncoming(opusPayload: ByteArray) {
@@ -190,12 +202,18 @@ class CallAudioSession(
         captureThread?.interrupt()
         captureThread = null
         audioRecord?.run {
-            stop()
+            try {
+                stop()
+            } catch (_: Exception) {
+            }
             release()
         }
         audioRecord = null
         audioTrack?.run {
-            stop()
+            try {
+                stop()
+            } catch (_: Exception) {
+            }
             release()
         }
         audioTrack = null

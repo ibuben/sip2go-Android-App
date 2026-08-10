@@ -165,6 +165,7 @@
     <string name="status_disconnected">Отключено: %1$s</string>
     <string name="status_connected_to">Соединение с %1$s</string>
     <string name="status_in_call_with">Разговор с %1$s</string>
+    <string name="status_audio_failed">Не удалось запустить звук — проверьте разрешение микрофона</string>
     <string name="status_calling">Вызов %1$s…</string>
     <string name="status_call_ended_remote">Собеседник завершил звонок</string>
     <string name="status_call_rejected">Звонок отклонён</string>
