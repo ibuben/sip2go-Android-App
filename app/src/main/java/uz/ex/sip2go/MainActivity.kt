@@ -565,9 +565,7 @@ class MainActivity : ComponentActivity() {
             } else {
                 app.deviceClient.setAppInForeground(true)
                 val state = app.deviceClient.connectionState.value
-                val inCall = app.deviceClient.activeCall.value != null ||
-                    app.deviceClient.outgoingCall.value != null ||
-                    app.deviceClient.incomingCall.value != null
+                val inCall = app.deviceClient.isCallSessionActive()
                 if (state != ConnectionState.REGISTERED && !inCall) {
                     val backgroundPush = settings.backgroundPushMode
                     if (!(backgroundPush && state == ConnectionState.IDLE)) {
@@ -579,10 +577,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        val inCall = app.deviceClient.activeCall.value != null ||
-            app.deviceClient.outgoingCall.value != null ||
-            app.deviceClient.incomingCall.value != null
-        if (!inCall) {
+        if (!app.deviceClient.isCallSessionActive()) {
             app.deviceClient.setAppInForeground(false)
         }
         super.onStop()

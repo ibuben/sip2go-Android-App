@@ -13,8 +13,8 @@ android {
         applicationId = "uz.ex.sip2go"
         minSdk = 26
         targetSdk = 36
-        versionCode = 23
-        versionName = "0.5.3"
+        versionCode = 31
+        versionName = "0.6.7"
     }
 
     buildTypes {
