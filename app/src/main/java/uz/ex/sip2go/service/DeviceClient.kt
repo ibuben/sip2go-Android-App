@@ -1,6 +1,9 @@
 package uz.ex.sip2go.service
 
 import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -88,7 +91,11 @@ class DeviceClient(
 ) : DeviceWebSocketListener {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val fcmManager = FcmManager(settingsStore)
-    private val networkMonitor = NetworkMonitor(appContext) { onNetworkAvailable() }
+    private val networkMonitor = NetworkMonitor(
+        appContext,
+        onNetworkAvailable = { onNetworkAvailable() },
+        onNetworkLost = { onNetworkLost() },
+    )
 
     private val _connectionState = MutableStateFlow(ConnectionState.STOPPED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
@@ -148,6 +155,18 @@ class DeviceClient(
     @Volatile
     private var connectInFlight = false
     private var callRecoveryJob: Job? = null
+    private var connectWatchdogJob: Job? = null
+    private var reconnectGraceSec = 10
+    private var callRecoveryStartedAtMs = 0L
+    private var networkSettleJob: Job? = null
+    private var resyncWaitJob: Job? = null
+    private var callLinkWatchdogJob: Job? = null
+    private var connectedNetworkHandle: Network? = null
+    private var lastWsActivityMs = 0L
+    private var connectStartedAtMs = 0L
+    private var recoveryRegisteredAtMs = 0L
+    private var recoveryAwaitingResync = false
+    private var recoverySnapshot: CallRecoverySnapshot? = null
     private var userAudioRoute: CallAudioRoute? = null
     @Volatile
     private var routeSettlingUntilMs = 0L
@@ -163,6 +182,14 @@ class DeviceClient(
         val contactName: String? = null,
         val contactId: Long? = null,
         val startedAt: Long = System.currentTimeMillis(),
+    )
+
+    private data class CallRecoverySnapshot(
+        val callId: UUID,
+        val active: ActiveCallUi?,
+        val outgoing: OutgoingCallUi?,
+        val incoming: IncomingCallUi?,
+        val connectedAt: Long?,
     )
 
     private val pendingHistory = mutableMapOf<UUID, PendingHistory>()
@@ -304,7 +331,7 @@ class DeviceClient(
     }
 
     fun wakeForIncomingCall() {
-        keepConnected = false
+        keepConnected = true
         shouldRun = true
         idleJob?.cancel()
         reconnectJob?.cancel()
@@ -328,9 +355,14 @@ class DeviceClient(
         keepConnected = false
         stopNetworkMonitor()
         stopCallRecoveryLoop()
+        stopCallLinkWatchdog()
         reconnectJob?.cancel()
         pingJob?.cancel()
         idleJob?.cancel()
+        networkSettleJob?.cancel()
+        resyncWaitJob?.cancel()
+        unbindActiveNetwork()
+        stopConnectWatchdog()
         stopAudio()
         scope.launch { discardCallRecording() }
         stopRingback()
@@ -357,20 +389,25 @@ class DeviceClient(
         }
     }
 
+    /** True while dialing or any call screen should stay up (incl. optimistic outgoing UI). */
+    fun isCallSessionActive(): Boolean = hasCallUi()
+
     suspend fun dialWhenReadyViaTelecom(number: String) {
         val trimmed = number.trim()
         if (trimmed.isEmpty()) {
             _statusMessage.value = msg(R.string.status_enter_number)
             return
         }
-        if (_activeCall.value != null || _incomingCall.value != null || _outgoingCall.value != null) {
+        if (isRealCallUi()) {
             _statusMessage.value = msg(R.string.status_already_in_call)
             return
         }
+        beginOutgoingDial(trimmed)
         connectForOutgoing()
         if (_connectionState.value != ConnectionState.REGISTERED) {
             _statusMessage.value = msg(R.string.status_connecting)
             if (!awaitRegistered(DIAL_CONNECT_TIMEOUT_MS)) {
+                cancelPendingOutgoing()
                 _statusMessage.value = msg(R.string.status_could_not_connect)
                 return
             }
@@ -378,7 +415,7 @@ class DeviceClient(
         if (TelecomBridge.placeOutgoing(trimmed)) {
             return
         }
-        dial(trimmed)
+        sendOutgoingDial(trimmed)
     }
 
     fun acceptCallFromTelecom(callId: UUID) {
@@ -404,8 +441,17 @@ class DeviceClient(
             return
         }
         pendingHangupCallId = callId
+        stopCallRecoveryLoop()
+        resyncWaitJob?.cancel()
+        reconnectJob?.cancel()
+        connectInFlight = false
         stopRingback()
-        webSocket?.sendControl(Protocol.HANGUP, callId)
+        if (_connectionState.value == ConnectionState.REGISTERED) {
+            webSocket?.sendControl(Protocol.HANGUP, callId)
+            pendingHangupCallId = null
+        } else {
+            pendingHangupCallId = null
+        }
         scope.launch { completeCallEnd(callId, "hangup") }
         IncomingCallNotifier.dismiss(appContext)
         stopAudio()
@@ -413,7 +459,8 @@ class DeviceClient(
         _outgoingCall.value = null
         _activeCall.value = null
         _callReconnecting.value = false
-        if (shouldRun && _connectionState.value != ConnectionState.REGISTERED) {
+        callRecoveryStartedAtMs = 0L
+        if (shouldRun && keepConnected && _connectionState.value != ConnectionState.REGISTERED) {
             reconnectAttempt = 0
             scheduleReconnect()
         }
@@ -421,7 +468,7 @@ class DeviceClient(
     }
 
     fun dial(number: String) {
-        if (_activeCall.value != null || _incomingCall.value != null || _outgoingCall.value != null) {
+        if (isRealCallUi()) {
             _statusMessage.value = msg(R.string.status_already_in_call)
             return
         }
@@ -434,10 +481,8 @@ class DeviceClient(
             _statusMessage.value = msg(R.string.status_enter_number)
             return
         }
-        webSocket?.sendDial(trimmed)
-        pendingDialNumber = trimmed
-        scope.launch { callHistoryStore.saveLastDialed(trimmed) }
-        _statusMessage.value = msg(R.string.status_dialing, trimmed)
+        beginOutgoingDial(trimmed)
+        sendOutgoingDial(trimmed)
     }
 
     /** Connect if needed and dial once the WebSocket is registered. */
@@ -447,19 +492,63 @@ class DeviceClient(
             _statusMessage.value = msg(R.string.status_enter_number)
             return
         }
-        if (_activeCall.value != null || _incomingCall.value != null || _outgoingCall.value != null) {
+        if (isRealCallUi()) {
             _statusMessage.value = msg(R.string.status_already_in_call)
             return
         }
+        beginOutgoingDial(trimmed)
         connectForOutgoing()
         if (_connectionState.value != ConnectionState.REGISTERED) {
             _statusMessage.value = msg(R.string.status_connecting)
             if (!awaitRegistered(DIAL_CONNECT_TIMEOUT_MS)) {
+                cancelPendingOutgoing()
                 _statusMessage.value = msg(R.string.status_could_not_connect)
                 return
             }
         }
-        dial(trimmed)
+        sendOutgoingDial(trimmed)
+    }
+
+    private fun beginOutgoingDial(number: String) {
+        clearCallRecovery()
+        _callReconnecting.value = false
+        callRecoveryStartedAtMs = 0L
+        stopCallRecoveryLoop()
+        resyncWaitJob?.cancel()
+        reconnectJob?.cancel()
+        pendingDialNumber = number
+        enterCallSession()
+        keepConnected = true
+        shouldRun = true
+        idleJob?.cancel()
+        _outgoingCall.value = OutgoingCallUi(
+            callId = PLACEHOLDER_CALL_ID,
+            caller = "",
+            number = number,
+        )
+        _statusMessage.value = msg(R.string.status_dialing, number)
+        scope.launch { callHistoryStore.saveLastDialed(number) }
+        runCatching { OngoingCallNotifier.show(appContext, PLACEHOLDER_CALL_ID, number) }
+    }
+
+    private fun sendOutgoingDial(number: String) {
+        webSocket?.sendDial(number)
+    }
+
+    private fun cancelPendingOutgoing() {
+        if (_outgoingCall.value?.callId == PLACEHOLDER_CALL_ID) {
+            _outgoingCall.value = null
+        }
+        pendingDialNumber = ""
+        stopRingback()
+        OngoingCallNotifier.dismiss(appContext)
+    }
+
+    private fun isRealCallUi(): Boolean {
+        val outgoing = _outgoingCall.value
+        return _activeCall.value != null ||
+            _incomingCall.value != null ||
+            (outgoing != null && outgoing.callId != PLACEHOLDER_CALL_ID)
     }
 
     private suspend fun awaitRegistered(timeoutMs: Long): Boolean {
@@ -481,6 +570,11 @@ class DeviceClient(
     }
 
     fun cancelOutgoing() {
+        if (_outgoingCall.value?.callId == PLACEHOLDER_CALL_ID) {
+            cancelPendingOutgoing()
+            scheduleGoIdle()
+            return
+        }
         hangupCall()
     }
 
@@ -515,10 +609,25 @@ class DeviceClient(
             ?: _outgoingCall.value?.callId
             ?: _incomingCall.value?.callId
             ?: return
+        if (callId == PLACEHOLDER_CALL_ID) {
+            cancelPendingOutgoing()
+            scheduleGoIdle()
+            return
+        }
         pendingHangupCallId = callId
+        stopCallRecoveryLoop()
+        resyncWaitJob?.cancel()
+        clearCallRecovery()
+        reconnectJob?.cancel()
+        connectInFlight = false
         stopRingback()
         clearUserAudioRoute()
-        webSocket?.sendControl(Protocol.HANGUP, callId)
+        if (_connectionState.value == ConnectionState.REGISTERED) {
+            webSocket?.sendControl(Protocol.HANGUP, callId)
+            pendingHangupCallId = null
+        } else {
+            pendingHangupCallId = null
+        }
         scope.launch { completeCallEnd(callId, "hangup") }
         IncomingCallNotifier.dismiss(appContext)
         stopAudio()
@@ -528,7 +637,8 @@ class DeviceClient(
         _outgoingCall.value = null
         _activeCall.value = null
         _callReconnecting.value = false
-        if (shouldRun && _connectionState.value != ConnectionState.REGISTERED) {
+        callRecoveryStartedAtMs = 0L
+        if (shouldRun && keepConnected && _connectionState.value != ConnectionState.REGISTERED) {
             reconnectAttempt = 0
             scheduleReconnect()
         }
@@ -619,9 +729,13 @@ class DeviceClient(
         webSocket?.sendDtmf(callId, digit)
     }
 
-    private fun connectNow() {
-        if (connectInFlight) {
+    private fun connectNow(force: Boolean = false) {
+        if (connectInFlight && !force) {
             return
+        }
+        if (force) {
+            connectInFlight = false
+            stopConnectWatchdog()
         }
         if (!networkMonitor.hasInternet()) {
             _statusMessage.value = msg(R.string.status_waiting_network)
@@ -629,6 +743,9 @@ class DeviceClient(
             return
         }
         connectInFlight = true
+        connectStartedAtMs = System.currentTimeMillis()
+        startConnectWatchdog()
+        val inCallRecovery = _callReconnecting.value || hasCallUi()
         scope.launch {
             try {
                 val settings = settingsStore.settings.first()
@@ -637,34 +754,150 @@ class DeviceClient(
                     _statusMessage.value = msg(R.string.status_fill_credentials)
                     shouldRun = false
                     connectInFlight = false
+                    stopConnectWatchdog()
                     return@launch
                 }
-                if (currentFcmToken.isNullOrBlank()) {
-                    currentFcmToken = fcmManager.refreshAndUpload()
-                } else {
-                    launch(Dispatchers.IO) {
-                        fcmManager.refreshAndUpload()
+                if (!inCallRecovery) {
+                    if (currentFcmToken.isNullOrBlank()) {
+                        currentFcmToken = fcmManager.refreshAndUpload()
+                    } else {
+                        launch(Dispatchers.IO) {
+                            fcmManager.refreshAndUpload()
+                        }
                     }
                 }
                 connect(settings, currentFcmToken)
             } catch (e: Exception) {
                 Log.e(TAG, "connectNow failed", e)
                 connectInFlight = false
+                stopConnectWatchdog()
                 scheduleReconnect()
             }
         }
     }
 
+    private fun reconnectForCall(reason: String) {
+        Log.i(TAG, "Call reconnect triggered: $reason")
+        beginCallRecovery()
+    }
+
+    /** Same clean gateway reconnect that worked after local timeout — without closing call UI. */
+    private fun resetGatewayConnectionForCallRecovery() {
+        Log.i(TAG, "Hard gateway reset for call recovery")
+        restoreCallUiFromSnapshot()
+        connectInFlight = false
+        stopConnectWatchdog()
+        stopCallLinkWatchdog()
+        unbindActiveNetwork()
+        resyncWaitJob?.cancel()
+        reconnectJob?.cancel()
+        pingJob?.cancel()
+        forceWsReconnect()
+        recoveryAwaitingResync = false
+        recoveryRegisteredAtMs = 0L
+        audioSession?.stop()
+        audioSession = null
+        reconnectAttempt = 0
+        _callReconnecting.value = true
+        _connectionState.value = ConnectionState.CONNECTING
+        _statusMessage.value = msg(R.string.status_reconnecting)
+        scheduleReconnect()
+    }
+
+    private fun scheduleHardGatewayReset(delayMs: Long = HARD_RECONNECT_INTERVAL_MS) {
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            delay(delayMs)
+            if (!_callReconnecting.value || !shouldRun) return@launch
+            if (_outgoingCall.value?.callId == PLACEHOLDER_CALL_ID) return@launch
+            if (_connectionState.value == ConnectionState.REGISTERED && webSocket != null) {
+                if (!recoveryAwaitingResync) {
+                    recoveryAwaitingResync = true
+                    recoveryRegisteredAtMs = System.currentTimeMillis()
+                    scheduleResyncOrEnd()
+                }
+                return@launch
+            }
+            if (!networkMonitor.hasInternet()) {
+                _statusMessage.value = msg(R.string.status_waiting_network)
+                scheduleHardGatewayReset(HARD_RECONNECT_INTERVAL_MS)
+                return@launch
+            }
+            resetGatewayConnectionForCallRecovery()
+        }
+    }
+
+    private fun restoreCallUiFromSnapshot() {
+        recoverySnapshot?.let { snap ->
+            if (_activeCall.value == null && snap.active != null) {
+                _activeCall.value = snap.active
+            }
+            if (_outgoingCall.value == null && snap.outgoing != null) {
+                _outgoingCall.value = snap.outgoing
+            }
+            if (_incomingCall.value == null && snap.incoming != null) {
+                _incomingCall.value = snap.incoming
+            }
+            snap.connectedAt?.let { connectedAt ->
+                callAcceptedAt[snap.callId] = connectedAt
+                _callConnectedAt.value = connectedAt
+            }
+        }
+    }
+
+    private fun beginCallRecovery() {
+        if (recoverySnapshot == null) {
+            val callId = _activeCall.value?.callId
+                ?: _outgoingCall.value?.callId
+                ?: _incomingCall.value?.callId
+            if (callId != null) {
+                recoverySnapshot = CallRecoverySnapshot(
+                    callId = callId,
+                    active = _activeCall.value,
+                    outgoing = _outgoingCall.value,
+                    incoming = _incomingCall.value,
+                    connectedAt = _callConnectedAt.value ?: callAcceptedAt[callId],
+                )
+            }
+        } else {
+            recoverySnapshot?.let { snap ->
+                if (_activeCall.value == null && snap.active != null) {
+                    _activeCall.value = snap.active
+                }
+                if (_outgoingCall.value == null && snap.outgoing != null) {
+                    _outgoingCall.value = snap.outgoing
+                }
+                if (_incomingCall.value == null && snap.incoming != null) {
+                    _incomingCall.value = snap.incoming
+                }
+                snap.connectedAt?.let { connectedAt ->
+                    if (_callConnectedAt.value == null) {
+                        _callConnectedAt.value = connectedAt
+                    }
+                }
+            }
+        }
+        _callReconnecting.value = true
+        if (callRecoveryStartedAtMs <= 0L) {
+            callRecoveryStartedAtMs = System.currentTimeMillis()
+        }
+        recoveryRegisteredAtMs = 0L
+        recoveryAwaitingResync = false
+        ensureCallRecoveryLoop()
+        scheduleHardGatewayReset(HARD_RECONNECT_INITIAL_MS)
+    }
+
+    private fun clearCallRecovery() {
+        recoverySnapshot = null
+        recoveryRegisteredAtMs = 0L
+        recoveryAwaitingResync = false
+        callRecoveryStartedAtMs = 0L
+        _callReconnecting.value = false
+        resyncWaitJob?.cancel()
+    }
+
     private fun connect(settings: DeviceSettings, fcmToken: String?) {
         scope.launch { refreshBranding(settings.wsUrl) }
-        if (_connectionState.value == ConnectionState.REGISTERED && webSocket != null) {
-            connectInFlight = false
-            return
-        }
-        if (_connectionState.value == ConnectionState.CONNECTING && webSocket != null) {
-            connectInFlight = false
-            return
-        }
         reconnectJob?.cancel()
         pingJob?.cancel()
         idleJob?.cancel()
@@ -687,6 +920,69 @@ class DeviceClient(
         ).also { it.connect() }
     }
 
+    private fun bindToActiveNetwork(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return false
+        }
+        val network = networkMonitor.preferredNetwork() ?: return false
+        val cm = appContext.getSystemService(ConnectivityManager::class.java)
+        val bound = cm.bindProcessToNetwork(network)
+        if (bound) {
+            connectedNetworkHandle = network
+            Log.i(TAG, "Process bound to network $network")
+        } else {
+            Log.w(TAG, "Could not bind process to network $network")
+        }
+        return bound
+    }
+
+    private fun unbindActiveNetwork() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return
+        }
+        connectedNetworkHandle = null
+        appContext.getSystemService(ConnectivityManager::class.java).bindProcessToNetwork(null)
+    }
+
+    private fun enterCallSession() {
+        keepConnected = true
+        shouldRun = true
+        startNetworkMonitor()
+        startCallLinkWatchdog()
+    }
+
+    private fun leaveCallSession() {
+        stopCallLinkWatchdog()
+    }
+
+    private fun startCallLinkWatchdog() {
+        callLinkWatchdogJob?.cancel()
+        callLinkWatchdogJob = scope.launch {
+            while (hasCallUi() && shouldRun) {
+                delay(CALL_LINK_CHECK_MS)
+                if (!hasCallUi() || !shouldRun) break
+                if (_activeCall.value != null &&
+                    _connectionState.value == ConnectionState.REGISTERED &&
+                    webSocket != null &&
+                    !_callReconnecting.value &&
+                    lastWsActivityMs > 0L &&
+                    System.currentTimeMillis() - lastWsActivityMs > CALL_LINK_STALE_MS
+                ) {
+                    reconnectForCall("websocket stale")
+                }
+            }
+        }
+    }
+
+    private fun stopCallLinkWatchdog() {
+        callLinkWatchdogJob?.cancel()
+        callLinkWatchdogJob = null
+    }
+
+    private fun markWsActivity() {
+        lastWsActivityMs = System.currentTimeMillis()
+    }
+
     private fun scheduleReconnect() {
         if (!shouldRun) return
         reconnectJob?.cancel()
@@ -704,28 +1000,48 @@ class DeviceClient(
             if (_connectionState.value == ConnectionState.REGISTERED && webSocket != null) {
                 return@launch
             }
-            connectNow()
+            connectNow(force = _callReconnecting.value || hasCallUi())
         }
     }
 
     private fun startCallRecoveryLoop() {
         callRecoveryJob?.cancel()
+        if (callRecoveryStartedAtMs <= 0L) {
+            callRecoveryStartedAtMs = System.currentTimeMillis()
+        }
         callRecoveryJob = scope.launch {
             while (_callReconnecting.value && shouldRun) {
                 if (_connectionState.value == ConnectionState.REGISTERED && webSocket != null) {
+                    if (!recoveryAwaitingResync) {
+                        recoveryRegisteredAtMs = System.currentTimeMillis()
+                        recoveryAwaitingResync = true
+                        scheduleResyncOrEnd()
+                    }
+                    delay(HARD_RECONNECT_INTERVAL_MS)
+                    continue
+                }
+                if (callRecoveryHardTimedOut()) {
+                    Log.w(TAG, "Call recovery expired — ending call")
+                    endCallAfterRecoveryTimeout()
                     break
                 }
-                if (networkMonitor.hasInternet()) {
-                    if (!connectInFlight) {
-                        reconnectAttempt = 0
-                        connectNow()
-                    }
-                } else {
-                    _statusMessage.value = msg(R.string.status_waiting_network)
-                }
-                delay(CALL_RECOVERY_INTERVAL_MS)
+                delay(HARD_RECONNECT_INTERVAL_MS)
             }
         }
+    }
+
+    private fun callRecoveryHardTimedOut(): Boolean {
+        if (callRecoveryStartedAtMs <= 0L) return false
+        val budgetMs = reconnectGraceSec * 1000L + RESYNC_WAIT_MS
+        return System.currentTimeMillis() - callRecoveryStartedAtMs > budgetMs
+    }
+
+    private fun endCallAfterRecoveryTimeout() {
+        val callId = _activeCall.value?.callId
+            ?: _outgoingCall.value?.callId
+            ?: _incomingCall.value?.callId
+            ?: return
+        onCallEnded(callId, "reconnect_timeout")
     }
 
     private fun stopCallRecoveryLoop() {
@@ -733,16 +1049,82 @@ class DeviceClient(
         callRecoveryJob = null
     }
 
+    private fun ensureCallRecoveryLoop() {
+        if (callRecoveryJob?.isActive != true) {
+            startCallRecoveryLoop()
+        }
+    }
+
+    private fun forceWsReconnect() {
+        connectInFlight = false
+        stopConnectWatchdog()
+        reconnectJob?.cancel()
+        pingJob?.cancel()
+        webSocket?.disconnect()
+        webSocket = null
+        if (_connectionState.value != ConnectionState.STOPPED &&
+            _connectionState.value != ConnectionState.IDLE
+        ) {
+            _connectionState.value = ConnectionState.CONNECTING
+        }
+    }
+
     private fun onNetworkAvailable() {
         if (!shouldRun) return
-        if (_connectionState.value == ConnectionState.REGISTERED && webSocket != null) {
+        networkSettleJob?.cancel()
+        networkSettleJob = scope.launch {
+            delay(NETWORK_SETTLE_MS)
+            if (!shouldRun) return@launch
+            val inCall = hasCallUi()
+            if (inCall) {
+                reconnectForCall("network available")
+                return@launch
+            } else if (_connectionState.value == ConnectionState.REGISTERED && webSocket != null) {
+                return@launch
+            }
+            Log.i(TAG, "Network ready — reconnecting WebSocket")
+            reconnectAttempt = 0
+            forceWsReconnect()
+            connectNow(force = true)
+        }
+    }
+
+    private fun onNetworkLost() {
+        if (!shouldRun) return
+        if (networkMonitor.hasInternet()) {
+            onNetworkAvailable()
             return
         }
-        Log.i(TAG, "Network available — reconnecting WebSocket")
-        reconnectAttempt = 0
-        connectInFlight = false
-        reconnectJob?.cancel()
-        connectNow()
+        Log.i(TAG, "Network offline — closing WebSocket")
+        networkSettleJob?.cancel()
+        forceWsReconnect()
+        if (hasCallUi()) {
+            beginCallRecovery()
+            _connectionState.value = ConnectionState.CONNECTING
+            _statusMessage.value = msg(R.string.status_waiting_network)
+        } else if (_connectionState.value != ConnectionState.STOPPED) {
+            _connectionState.value = ConnectionState.CONNECTING
+            _statusMessage.value = msg(R.string.status_waiting_network)
+        }
+    }
+
+    private fun startConnectWatchdog() {
+        connectWatchdogJob?.cancel()
+        connectWatchdogJob = scope.launch {
+            delay(CONNECT_TIMEOUT_MS)
+            if (!connectInFlight) return@launch
+            if (_connectionState.value == ConnectionState.REGISTERED && webSocket != null) {
+                return@launch
+            }
+            Log.w(TAG, "WebSocket connect timed out — retrying")
+            forceWsReconnect()
+            scheduleReconnect()
+        }
+    }
+
+    private fun stopConnectWatchdog() {
+        connectWatchdogJob?.cancel()
+        connectWatchdogJob = null
     }
 
     private fun startNetworkMonitor() {
@@ -763,9 +1145,7 @@ class DeviceClient(
             if (
                 shouldRun &&
                 !keepConnected &&
-                _activeCall.value == null &&
-                _incomingCall.value == null &&
-                _outgoingCall.value == null
+                !hasCallUi()
             ) {
                 goIdle()
             }
@@ -780,7 +1160,7 @@ class DeviceClient(
                 keepConnected = false
                 if (_connectionState.value == ConnectionState.IDLE) {
                     DeviceService.releaseForeground(appContext)
-                } else {
+                } else if (!hasCallUi()) {
                     goIdle()
                 }
                 return@launch
@@ -825,8 +1205,13 @@ class DeviceClient(
         idleJob?.cancel()
         reconnectJob?.cancel()
         pingJob?.cancel()
+        networkSettleJob?.cancel()
+        resyncWaitJob?.cancel()
+        stopConnectWatchdog()
         stopCallRecoveryLoop()
+        stopCallLinkWatchdog()
         stopNetworkMonitor()
+        unbindActiveNetwork()
         webSocket?.disconnect()
         webSocket = null
         shouldRun = false
@@ -836,9 +1221,14 @@ class DeviceClient(
 
     private fun startPingLoop() {
         pingJob?.cancel()
+        val intervalMs = if (hasCallUi() || _callReconnecting.value) {
+            CALL_PING_INTERVAL_MS
+        } else {
+            PING_INTERVAL_MS
+        }
         pingJob = scope.launch {
             while (shouldRun && _connectionState.value == ConnectionState.REGISTERED) {
-                delay(PING_INTERVAL_MS)
+                delay(intervalMs)
                 webSocket?.sendPing()
             }
         }
@@ -898,6 +1288,8 @@ class DeviceClient(
 
     private fun startAudio(callId: UUID, preferredRoute: CallAudioRoute = capturePreferredAudioRoute()) {
         rememberUserAudioRoute(preferredRoute)
+        // Stop local ringback immediately on answer — do not wait for async FGS / AudioRecord.
+        stopRingback(releaseAudio = false)
         // FGS / AudioRecord must not race on the main thread under targetSdk 34+.
         scope.launch(Dispatchers.Default) {
             CallAudioFocus.acquire(appContext)
@@ -1060,7 +1452,8 @@ class DeviceClient(
     }
 
     private fun startRingback() {
-        if (ringbackPlayer != null) {
+        // Never restart tones once the remote party has answered.
+        if (_activeCall.value != null || ringbackPlayer != null) {
             return
         }
         CallAudioFocus.acquire(appContext)
@@ -1099,11 +1492,14 @@ class DeviceClient(
 
     override fun onConnected() {
         connectInFlight = false
+        stopConnectWatchdog()
+        markWsActivity()
         _connectionState.value = ConnectionState.CONNECTED
         _statusMessage.value = msg(R.string.status_connected_registering)
     }
 
-    override fun onRegistered(organizationName: String?) {
+    override fun onRegistered(organizationName: String?, reconnectGraceSec: Int) {
+        this.reconnectGraceSec = reconnectGraceSec.coerceAtLeast(5)
         scope.launch {
             if (!organizationName.isNullOrBlank()) {
                 applyOrganizationName(organizationName)
@@ -1112,9 +1508,10 @@ class DeviceClient(
             }
         }
         connectInFlight = false
+        stopConnectWatchdog()
+        markWsActivity()
         reconnectAttempt = 0
         reconnectJob?.cancel()
-        stopCallRecoveryLoop()
         pendingHangupCallId?.let { callId ->
             pendingHangupCallId = null
             webSocket?.sendControl(Protocol.HANGUP, callId)
@@ -1131,8 +1528,8 @@ class DeviceClient(
             msg(R.string.status_connecting_incoming)
         }
         startPingLoop()
-        if (_callReconnecting.value || hasCallUi()) {
-            scheduleResyncFallback()
+        if (_callReconnecting.value || recoverySnapshot != null) {
+            scheduleResyncOrEnd()
         }
         queuedDialNumber?.let { number ->
             queuedDialNumber = null
@@ -1158,31 +1555,40 @@ class DeviceClient(
         }
     }
 
-    private fun scheduleResyncFallback() {
-        scope.launch {
+    private fun scheduleResyncOrEnd() {
+        resyncWaitJob?.cancel()
+        resyncWaitJob = scope.launch {
             delay(RESYNC_WAIT_MS)
             if (!_callReconnecting.value) return@launch
-            Log.w(TAG, "call_resync not received — keeping call UI, clearing reconnect flag")
-            _callReconnecting.value = false
+            if (_connectionState.value != ConnectionState.REGISTERED) {
+                scheduleHardGatewayReset(0L)
+                return@launch
+            }
+            Log.w(TAG, "Registered but no call_resync — hard gateway reset")
+            scheduleHardGatewayReset(0L)
         }
     }
 
     override fun onDisconnected(reason: String) {
         connectInFlight = false
+        stopConnectWatchdog()
         pingJob?.cancel()
         webSocket = null
         val hadCall = hasCallUi()
         if (hadCall && shouldRun) {
-            _callReconnecting.value = true
+            beginCallRecovery()
             reconnectAttempt++
             _connectionState.value = ConnectionState.CONNECTING
             _statusMessage.value = msg(R.string.status_reconnecting)
             startNetworkMonitor()
-            startCallRecoveryLoop()
-            scheduleReconnect()
+            scheduleHardGatewayReset(HARD_RECONNECT_INITIAL_MS)
             return
         }
-        stopAudio()
+        if (_callReconnecting.value) {
+            stopAudio(resetRouteUi = false)
+        } else {
+            stopAudio()
+        }
         if (_activeCall.value != null) {
             _incomingCall.value = null
             _outgoingCall.value = null
@@ -1192,7 +1598,9 @@ class DeviceClient(
         if (shouldRun) {
             reconnectAttempt++
             _connectionState.value = ConnectionState.CONNECTING
-            _statusMessage.value = msg(R.string.status_disconnected, reason)
+            if (!keepConnected) {
+                _statusMessage.value = msg(R.string.status_disconnected, reason)
+            }
             scheduleReconnect()
         } else if (_connectionState.value != ConnectionState.STOPPED) {
             reconnectAttempt = 0
@@ -1210,22 +1618,35 @@ class DeviceClient(
         held: Boolean,
     ) {
         connectInFlight = false
+        stopConnectWatchdog()
         stopCallRecoveryLoop()
-        _callReconnecting.value = false
+        val snapshot = recoverySnapshot
+        clearCallRecovery()
         reconnectAttempt = 0
         reconnectJob?.cancel()
         when (state) {
             "active" -> {
+                enterCallSession()
                 val preferredRoute = capturePreferredAudioRoute()
                 rememberUserAudioRoute(preferredRoute)
+                stopRingback(releaseAudio = false)
                 _incomingCall.value = null
                 _outgoingCall.value = null
+                val restoredContactName = snapshot?.active?.contactName
+                val restoredContactId = snapshot?.active?.contactId
                 _activeCall.value = ActiveCallUi(
                     callId = callId,
                     caller = caller,
                     called = called,
                     outgoing = outgoing,
+                    contactName = restoredContactName,
+                    contactId = restoredContactId,
                 )
+                val connectedAt = snapshot?.connectedAt
+                    ?: callAcceptedAt[callId]
+                    ?: System.currentTimeMillis()
+                callAcceptedAt[callId] = connectedAt
+                _callConnectedAt.value = connectedAt
                 _statusMessage.value = if (outgoing) {
                     msg(R.string.status_connected_to, called)
                 } else {
@@ -1247,20 +1668,25 @@ class DeviceClient(
                 _statusMessage.value = msg(R.string.status_incoming_from, caller)
             }
             "ringing", "outgoing" -> {
-                _incomingCall.value = null
-                _activeCall.value = null
-                _outgoingCall.value = OutgoingCallUi(
-                    callId = callId,
-                    caller = caller,
-                    number = called,
-                    ringing = state == "ringing",
-                )
-                _statusMessage.value = if (state == "ringing") {
-                    msg(R.string.outgoing_ringing)
+                // Stale ringing/outgoing resync after answer must not demote the call or restart tones.
+                if (_activeCall.value?.callId == callId) {
+                    stopRingback(releaseAudio = false)
                 } else {
-                    msg(R.string.status_calling, called)
+                    _incomingCall.value = null
+                    _activeCall.value = null
+                    _outgoingCall.value = OutgoingCallUi(
+                        callId = callId,
+                        caller = caller,
+                        number = called,
+                        ringing = state == "ringing",
+                    )
+                    _statusMessage.value = if (state == "ringing") {
+                        msg(R.string.outgoing_ringing)
+                    } else {
+                        msg(R.string.status_calling, called)
+                    }
+                    startRingback()
                 }
-                startRingback()
             }
         }
         enrichResyncContacts(callId, caller, called, outgoing, state)
@@ -1304,7 +1730,10 @@ class DeviceClient(
     }
 
     private fun hasCallUi(): Boolean =
-        _activeCall.value != null || _incomingCall.value != null || _outgoingCall.value != null
+        _activeCall.value != null ||
+            _incomingCall.value != null ||
+            _outgoingCall.value != null ||
+            pendingDialNumber.isNotEmpty()
 
     override fun onCallHoldChanged(callId: UUID, held: Boolean) {
         if (_activeCall.value?.callId != callId) return
@@ -1324,6 +1753,11 @@ class DeviceClient(
     override fun onError(message: String) {
         Log.e(TAG, "server error: $message")
         _statusMessage.value = message
+        if (_outgoingCall.value?.callId == PLACEHOLDER_CALL_ID ||
+            (pendingDialNumber.isNotEmpty() && _activeCall.value == null)
+        ) {
+            cancelPendingOutgoing()
+        }
         if (message.contains("invalid credentials", ignoreCase = true)) {
             _connectionState.value = ConnectionState.ERROR
             shouldRun = false
@@ -1332,8 +1766,21 @@ class DeviceClient(
     }
 
     override fun onDialing(callId: UUID, caller: String, number: String) {
+        // Late/duplicate dialing after answer must not revive ringback over the talk path.
+        if (_activeCall.value != null) return
+        enterCallSession()
+        clearCallRecovery()
+        _callReconnecting.value = false
         _incomingCall.value = null
-        _outgoingCall.value = OutgoingCallUi(callId, caller, number)
+        val previous = _outgoingCall.value
+        _outgoingCall.value = OutgoingCallUi(
+            callId = callId,
+            caller = caller,
+            number = number,
+            contactName = previous?.contactName,
+            contactId = previous?.contactId,
+        )
+        pendingDialNumber = number
         _statusMessage.value = msg(R.string.status_calling, number)
         startRingback()
         rememberPendingHistory(
@@ -1363,13 +1810,29 @@ class DeviceClient(
     }
 
     override fun onCallRinging(callId: UUID) {
-        _outgoingCall.value = _outgoingCall.value?.takeIf { it.callId == callId }?.copy(ringing = true)
+        // Late call_ringing after call_accepted must not restart tones over the conversation.
+        if (_activeCall.value != null) return
+        val current = _outgoingCall.value
+        if (current == null || (current.callId != callId && current.callId != PLACEHOLDER_CALL_ID)) {
+            _outgoingCall.value = OutgoingCallUi(
+                callId = callId,
+                caller = current?.caller ?: "",
+                number = current?.number ?: pendingDialNumber,
+                ringing = true,
+                contactName = current?.contactName,
+                contactId = current?.contactId,
+            )
+        } else {
+            _outgoingCall.value = current.copy(callId = callId, ringing = true)
+        }
+        pendingDialNumber = _outgoingCall.value?.number ?: pendingDialNumber
         _statusMessage.value = msg(R.string.outgoing_ringing)
         startRingback()
         TelecomBridge.notifyRinging(callId)
     }
 
     override fun onIncomingCall(callId: UUID, caller: String, called: String) {
+        enterCallSession()
         stopRingback()
         _outgoingCall.value = null
         _activeCall.value = null
@@ -1416,8 +1879,11 @@ class DeviceClient(
     }
 
     private fun onCallAcceptedInternal(callId: UUID) {
+        enterCallSession()
         val preferredRoute = capturePreferredAudioRoute()
         rememberUserAudioRoute(preferredRoute)
+        // Stop ringback as soon as the peer answers (startAudio is async and must not delay this).
+        stopRingback(releaseAudio = false)
         IncomingCallNotifier.stopAlert(appContext)
         val incoming = _incomingCall.value
         val outgoing = _outgoingCall.value
@@ -1497,16 +1963,21 @@ class DeviceClient(
         CallAudioFocus.release(appContext)
         connectInFlight = false
         stopCallRecoveryLoop()
-        _callReconnecting.value = false
+        leaveCallSession()
+        unbindActiveNetwork()
+        clearCallRecovery()
         pendingHangupCallId = null
         val shouldStopAudio = _activeCall.value?.callId == callId
         scope.launch { completeCallEnd(callId, reason) }
         if (_incomingCall.value?.callId == callId) {
             _incomingCall.value = null
         }
-        if (_outgoingCall.value?.callId == callId) {
+        if (_outgoingCall.value?.callId == callId ||
+            _outgoingCall.value?.callId == PLACEHOLDER_CALL_ID
+        ) {
             _outgoingCall.value = null
         }
+        pendingDialNumber = ""
         if (shouldStopAudio) {
             _activeCall.value = null
             stopAudio()
@@ -1645,20 +2116,30 @@ class DeviceClient(
     }
 
     override fun onAudio(callId: UUID, opus: ByteArray) {
+        markWsActivity()
         if (_activeCall.value?.callId == callId) {
             audioSession?.playIncoming(opus)
         }
     }
 
     companion object {
+        private val PLACEHOLDER_CALL_ID: UUID = UUID(0L, 0L)
+
         private const val TAG = "DeviceClient"
         private const val RECONNECT_DELAY_MS = 3_000L
         private const val RECONNECT_MAX_DELAY_MS = 30_000L
         private const val PING_INTERVAL_MS = 30_000L
+        private const val CALL_PING_INTERVAL_MS = 5_000L
+        private const val CALL_LINK_CHECK_MS = 2_000L
+        private const val CALL_LINK_STALE_MS = 8_000L
         private const val IDLE_DISCONNECT_MS = 5_000L
         private const val DIAL_CONNECT_TIMEOUT_MS = 20_000L
         private const val PUSH_ACCEPT_TIMEOUT_MS = 30_000L
-        private const val RESYNC_WAIT_MS = 2_000L
+        private const val RESYNC_WAIT_MS = 3_000L
+        private const val HARD_RECONNECT_INITIAL_MS = 2_000L
+        private const val HARD_RECONNECT_INTERVAL_MS = 4_000L
+        private const val NETWORK_SETTLE_MS = 400L
+        private const val CONNECT_TIMEOUT_MS = 12_000L
         private const val CALL_RECOVERY_INTERVAL_MS = 1_000L
         private const val ROUTE_SETTLING_MS = 500L
         private const val ROUTE_ENFORCE_DELAY_MS = 80L

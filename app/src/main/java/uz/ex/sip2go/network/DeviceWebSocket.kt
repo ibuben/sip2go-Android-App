@@ -15,7 +15,7 @@ import java.util.concurrent.TimeUnit
 
 interface DeviceWebSocketListener {
     fun onConnected()
-    fun onRegistered(organizationName: String? = null)
+    fun onRegistered(organizationName: String? = null, reconnectGraceSec: Int = 10)
     fun onDisconnected(reason: String)
     fun onError(message: String)
     fun onIncomingCall(callId: UUID, caller: String, called: String)
@@ -42,7 +42,7 @@ class DeviceWebSocket(
     private val fcmToken: String? = null,
     private val listener: DeviceWebSocketListener,
 ) {
-    private val client = sharedClient
+    private var client: OkHttpClient = buildClient()
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var webSocket: WebSocket? = null
@@ -57,6 +57,7 @@ class DeviceWebSocket(
     fun connect() {
         registered = false
         intentionalClose = false
+        client = buildClient()
         val request = Request.Builder().url(wsUrl).build()
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
@@ -180,7 +181,8 @@ class DeviceWebSocket(
             Protocol.REGISTERED -> {
                 registered = true
                 val org = json.optString("organization_name", "").trim()
-                dispatchMain { listener.onRegistered(org.ifBlank { null }) }
+                val grace = json.optInt("reconnect_grace_sec", 10)
+                dispatchMain { listener.onRegistered(org.ifBlank { null }, grace) }
             }
             Protocol.ERROR -> dispatchMain {
                 listener.onError(json.optString("message", "unknown error"))
@@ -264,12 +266,14 @@ class DeviceWebSocket(
     companion object {
         private const val TAG = "DeviceWebSocket"
 
-        private val sharedClient: OkHttpClient = OkHttpClient.Builder()
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.SECONDS)
-            .writeTimeout(10, TimeUnit.SECONDS)
-            .pingInterval(15, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(true)
-            .build()
+        private fun buildClient(): OkHttpClient {
+            return OkHttpClient.Builder()
+                .connectTimeout(5, TimeUnit.SECONDS)
+                .readTimeout(0, TimeUnit.SECONDS)
+                .writeTimeout(10, TimeUnit.SECONDS)
+                .pingInterval(15, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
+                .build()
+        }
     }
 }
